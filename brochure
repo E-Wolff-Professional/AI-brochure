@@ -27,15 +27,6 @@ from openai import OpenAI
 load_dotenv(override=True)
 api_key = os.getenv("OPENAI_API_KEY")
 
-# Quick sanity check so a missing/bad key fails early with a clear message.
-if api_key and api_key.startswith("sk-proj-") and len(api_key) > 10:
-    print("API key looks good so far")
-else:
-    print(
-        "There might be a problem with your API key? "
-        "Please visit the troubleshooting notebook!"
-    )
-
 # MODEL is used for the cheaper/faster "pick relevant links" step.
 MODEL = "gpt-5-nano"
 openai = OpenAI()  # Uses OPENAI_API_KEY from the environment by default
