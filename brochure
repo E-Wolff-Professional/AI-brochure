@@ -1,3 +1,17 @@
+# =============================================================================
+# AI Brochure Generator
+# =============================================================================
+# Big picture: scrape a company website → ask the LLM which pages matter →
+# scrape those pages → ask the LLM to write a short brochure from that text.
+#
+# Pipeline (top to bottom):
+#   1. Setup API key + OpenAI client
+#   2. Scrape homepage links
+#   3. Ask the LLM which links are brochure-relevant (JSON)
+#   4. Fetch homepage + those relevant pages
+#   5. Ask the LLM to write the brochure
+# =============================================================================
+
 import os
 import json
 from dotenv import load_dotenv
@@ -5,20 +19,185 @@ from IPython.display import Markdown, display, update_display
 from Scraper import fetch_website_links, fetch_website_contents
 from openai import OpenAI
 
+# -----------------------------------------------------------------------------
+# Step 1: Load secrets and create the OpenAI client
+# -----------------------------------------------------------------------------
+# load_dotenv reads key=value pairs from a local .env file into environment vars.
+# Keep OPENAI_API_KEY in .env — never hard-code it in this file.
 load_dotenv(override=True)
-api_key = os.getenv('OPENAI_API_KEY')
+api_key = os.getenv("OPENAI_API_KEY")
 
-if api_key and api_key.startswith('sk-proj-') and len(api_key)>10:
+# Quick sanity check so a missing/bad key fails early with a clear message.
+if api_key and api_key.startswith("sk-proj-") and len(api_key) > 10:
     print("API key looks good so far")
 else:
-    print("There might be a problem with your API key? Please visit the troubleshooting notebook!")
-    
-MODEL = 'gpt-5-nano'
-openai = OpenAI()
+    print(
+        "There might be a problem with your API key? "
+        "Please visit the troubleshooting notebook!"
+    )
 
-links = fetch_website_links("https://packers.com")
+# MODEL is used for the cheaper/faster "pick relevant links" step.
+MODEL = "gpt-5-nano"
+openai = OpenAI()  # Uses OPENAI_API_KEY from the environment by default
+
+
+# -----------------------------------------------------------------------------
+# Optional smoke test: scrape links from the homepage
+# Uncomment these while learning to inspect raw scraper output.
+# -----------------------------------------------------------------------------
+# links = fetch_website_links("https://packers.com")
 # contents = fetch_website_contents("https://packers.com")
-
-print(links)
+# print(links)
 # print(contents)
 
+
+# -----------------------------------------------------------------------------
+# Step 2: Prompt that teaches the LLM *how* to choose links
+# -----------------------------------------------------------------------------
+# System prompts set the model's role and output format.
+# We ask for JSON so the next Python step can parse the result reliably.
+link_system_prompt = """
+You are provided with a list of links found on a webpage.
+You are able to decide which of the links would be most relevant to include in a brochure about the company,
+such as links to an About page, or a Company page, or Careers/Jobs pages.
+You should respond in JSON as in this example:
+
+{
+    "links": [
+        {"type": "about page", "url": "https://full.url/goes/here/about"},
+        {"type": "careers page", "url": "https://another.full.url/careers"}
+    ]
+}
+"""
+
+
+def get_links_user_prompt(url):
+    """Build the user message: homepage URL + every link found on that page."""
+    user_prompt = f"""
+Here is the list of links on the website {url} -
+Please decide which of these are relevant web links for a brochure about the company,
+respond with the full https URL in JSON format.
+Do not include Terms of Service, Privacy, email links, or any links that are not relevant to the company.
+
+Links (some might be relative links):
+
+"""
+    # Scraper returns absolute URLs when possible; join them into one prompt block.
+    links = fetch_website_links(url)
+    user_prompt += "\n".join(links)
+    return user_prompt
+
+
+# Try while learning:
+# print(get_links_user_prompt("https://packers.com"))
+
+
+def select_relevant_links(url):
+    """
+    Step 3: Call the LLM to filter homepage links down to brochure-worthy ones.
+
+    Returns a Python dict shaped like:
+      {"links": [{"type": "...", "url": "..."}, ...]}
+    """
+    response = openai.chat.completions.create(
+        model=MODEL,
+        messages=[
+            # system = instructions / rules
+            {"role": "system", "content": link_system_prompt},
+            # user = the actual data for this run
+            {"role": "user", "content": get_links_user_prompt(url)},
+        ],
+        # Forces a JSON object so json.loads() below is safe to use.
+        response_format={"type": "json_object"},
+    )
+    # The model reply is text; parse it into a Python dict.
+    result = response.choices[0].message.content
+    links = json.loads(result)
+    return links
+
+
+# Try while learning:
+# print(select_relevant_links("https://packers.com"))
+
+
+def fetch_page_and_all_relevant_links(url):
+    """
+    Step 4: Gather the raw text the brochure will be based on.
+
+    Flow:
+      1. Fetch landing-page text
+      2. Ask the LLM which related links matter
+      3. Fetch each of those pages
+      4. Combine everything into one markdown-ish string
+    """
+    contents = fetch_website_contents(url)
+    relevant_links = select_relevant_links(url)
+
+    result = f"## Landing Page:\n\n{contents}\n## Relevant Links:\n"
+    for link in relevant_links["links"]:
+        # Each item looks like: {"type": "about page", "url": "https://..."}
+        result += f"\n\n### Link: {link['type']}\n"
+        # Some URLs may 403/404; Scraper skips those and returns a short notice.
+        result += fetch_website_contents(link["url"])
+    return result
+
+
+# Try while learning:
+# print(fetch_page_and_all_relevant_links("https://packers.com"))
+
+
+# -----------------------------------------------------------------------------
+# Step 5: Prompt that teaches the LLM *how* to write the brochure
+# -----------------------------------------------------------------------------
+brochure_system_prompt = """
+You are an assistant that analyzes the contents of several relevant pages from a company website
+and creates a short brochure about the company for prospective customers, investors and recruits.
+Respond in markdown without code blocks.
+Include details of company culture, customers and careers/jobs if you have the information.
+"""
+
+
+def get_brochure_user_prompt(company_name, url):
+    """
+    Build the brochure user message:
+    company name + scraped landing page + scraped relevant pages.
+    """
+    user_prompt = f"""
+You are looking at a company called: {company_name}
+Here are the contents of its landing page and other relevant pages;
+use this information to build a short brochure of the company in markdown without code blocks.\n\n
+"""
+    # This call does the heavy lifting: scrape + select links + scrape again.
+    user_prompt += fetch_page_and_all_relevant_links(url)
+    # Keep the prompt short enough for cost/latency; 5,000 chars is a simple cap.
+    user_prompt = user_prompt[:5_000]
+    return user_prompt
+
+
+# Try while learning:
+# print(get_brochure_user_prompt("Green Bay Packers", "https://packers.com"))
+
+
+def create_brochure(company_name, url):
+    """
+    Step 6 (final): Ask the LLM to write the brochure and display it.
+
+    Uses a stronger model than the link-picker because writing quality matters more here.
+    """
+    response = openai.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": brochure_system_prompt},
+            {"role": "user", "content": get_brochure_user_prompt(company_name, url)},
+        ],
+    )
+    result = response.choices[0].message.content
+    # Markdown(...) + display(...) renders nicely in Jupyter / IPython.
+    display(Markdown(result))
+
+
+# -----------------------------------------------------------------------------
+# Run it
+# -----------------------------------------------------------------------------
+# Uncomment when you want to generate the brochure end-to-end.
+# create_brochure("Green Bay Packers", "https://packers.com")
